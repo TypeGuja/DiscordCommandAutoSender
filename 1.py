@@ -3,7 +3,11 @@
 
 """
 Discord Bump Bot – полностью автоматический режим.
-...
+Поддерживает:
+  • двойной пробел после знаков пунктуации (настраиваемо);
+  • корректное определение bump‑сообщения (защита от копирования кода);
+  • планирование /up, /bump, /like;
+  • меню, горячую клавишу, журнал.
 """
 
 # ----------------------------------------------------------------------
@@ -18,7 +22,7 @@ import sys
 import time
 import traceback
 import unicodedata
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from threading import Lock
 from typing import Any, Dict, List, Optional
@@ -33,25 +37,27 @@ import pygetwindow as gw
 # ----------------------------------------------------------------------
 SCHEDULE_FILE = "schedule.json"
 RESPONSES_FILE = "responses.json"
-LOG_FILE = "bot.log"               # пустая строка → отключить запись в файл
-HOTKEY = "f12"                     # клавиша для вызова меню
-MESSAGE_SCAN_RETRIES = 5           # попыток копировать весь чат (Ctrl+A)
-TARGET_CHANNEL_NAME = "⁠🍀└・up-like"  # частичное совпадение названия канала
+LOG_FILE = "bot.log"                     # '' → отключить запись в файл
+HOTKEY = "f12"                           # клавиша для вызова меню
+MESSAGE_SCAN_RETRIES = 5                 # попыток копировать весь чат (Ctrl+A)
+TARGET_CHANNEL_NAME = "⁠🍀└・up-like"      # частичное совпадение названия канала
 
-# ---------------------- NEW SETTINGS ------------------------------------
-COPY_METHOD = "context_menu"       # "context_menu" | "ctrl_a"
-COPY_HOTKEY = "c"                  # клавиша в контекст‑меню (обычно «c»)
-COPY_CONTEXT_OFFSET_Y = 80          # от нижней границы окна Discord (пикс.)  # <-- изм.
-# ----------------------------------------------------------------------
+# ---- копирование -------------------------------------------------------
+COPY_METHOD = "context_menu"             # "context_menu" | "ctrl_a"
+COPY_HOTKEY = "c"                        # клавиша в контекст‑меню (обычно «c»)
+COPY_CONTEXT_OFFSET_RATIO = 0.12         # доля от высоты окна до точки клика
 
+# ---- двойной пробел ----------------------------------------------------
+DOUBLE_SPACE_ENABLED = True               # включить двойной пробел после .!? и в конце
 
 # ----------------------------------------------------------------------
 # GLOBAL STATE
 # ----------------------------------------------------------------------
-state_lock = Lock()                     # защита одновременного доступа
-task_counter = 0                         # автоинкремент ID задач
-scheduled_tasks: List[Dict[str, Any]] = []      # отложенные (однократные) команды
-bump_tasks: List[Dict[str, Any]] = []           # задачи автопарсинга (только в сессии)
+state_lock = Lock()
+task_counter = 0
+
+scheduled_tasks: List[Dict[str, Any]] = []   # отложенные однократные команды
+bump_tasks: List[Dict[str, Any]] = []        # задачи автопарсинга (только в текущей сессии)
 
 # ----------------------------------------------------------------------
 # LOGGING HELPERS
@@ -67,21 +73,24 @@ def _log(msg: str, level: str = "INFO") -> None:
         except Exception:
             pass
 
-def log_info(msg: str) -> None:    _log(msg, "INFO")
-def log_success(msg: str) -> None: _log(f"✅ {msg}", "SUCCESS")
-def log_error(msg: str) -> None:   _log(f"❌ {msg}", "ERROR")
-def log_warn(msg: str) -> None:    _log(f"⚠️ {msg}", "WARNING")
-def log_debug(msg: str) -> None:   _log(f"🔍 {msg}", "DEBUG")
-def log_status(msg: str) -> None:  _log(msg, "STATUS")
+
+def log_info(msg: str) -> None:            _log(msg, "INFO")
+def log_success(msg: str) -> None:        _log(f"✅ {msg}", "SUCCESS")
+def log_error(msg: str) -> None:           _log(f"❌ {msg}", "ERROR")
+def log_warn(msg: str) -> None:            _log(f"⚠️ {msg}", "WARNING")
+def log_debug(msg: str) -> None:           _log(f"🔍 {msg}", "DEBUG")
+def log_status(msg: str) -> None:          _log(msg, "STATUS")
+
 
 def _now_str() -> str:
     return datetime.now().strftime("%H:%M:%S")
+
 
 # ----------------------------------------------------------------------
 # TIME UTILITIES
 # ----------------------------------------------------------------------
 def format_seconds(seconds: int) -> str:
-    """`Xч Yм Zs` из количества секунд (для красивого вывода)."""
+    """Приводит количество секунд к виду «Xч Yм Zs»."""
     if seconds < 0:
         return "не определено"
     h, r = divmod(seconds, 3600)
@@ -98,16 +107,16 @@ def format_seconds(seconds: int) -> str:
 
 def parse_duration_to_seconds(text: str) -> Optional[int]:
     """
-    Преобразует любую строку с длительностью в секунды.
-    Поддерживает русские/английские единицы, любые разделители, HH:MM:SS.
+    Превращает строку вида «2 часа 5 минут 30 секунд», «2h 5m», «02:05:30» и т.п.
+    в количество секунд.
     """
     try:
-        # 1️⃣ Обрезаем всё после первой запятой – в большинстве сообщений это timestamp
-        if ',' in text:
-            text = text.split(',', 1)[0]
+        # Убираем всё после первой запятой (чаще всего timestamp)
+        if "," in text:
+            text = text.split(",", 1)[0]
 
         s = text.lower()
-        s = re.sub(r"[,\.;\(\)\[\]«»]", " ", s)
+        s = re.sub(r"[;:\.\,\(\)\[\]«»]", " ", s)
         s = re.sub(r"\b(и|в|на|c|со|cо|с)\b", " ", s)
         s = re.sub(r"\s+", " ", s).strip()
 
@@ -116,16 +125,16 @@ def parse_duration_to_seconds(text: str) -> Optional[int]:
                     "м": 60,   "m": 60,
                     "с": 1,    "s": 1}
 
-        # 3️⃣ Поиск «число + слово», где слово начинается с ч/м/с (или h/m/s)
+        # «число + слово», где слово начинается с ч/м/с (или h/m/s)
         for m in re.finditer(r"(\d+)\s*([a-zа-яё]+)", s):
             num = int(m.group(1))
             first = m.group(2)[0]
             if first in unit_map:
                 total += unit_map[first] * num
             else:
-                log_debug(f"Неизвестная единица времени: «{m.group(2)}»")
+                log_debug(f"Неизвестная единица: «{m.group(2)}»")
 
-        # 4️⃣ Если ничего не найдено – пробуем «чистые» числа
+        # Если ничего не найдено – пробуем «чистые» числа (HH:MM:SS, MM:SS, SS)
         if total == 0:
             nums = list(map(int, re.findall(r"\d+", s)))
             if len(nums) >= 3:
@@ -140,16 +149,12 @@ def parse_duration_to_seconds(text: str) -> Optional[int]:
         log_error(f"Ошибка парсинга длительности: {e}")
         return None
 
+
 # ----------------------------------------------------------------------
-# CHANNEL & WINDOW HELPERS
+# WINDOW / CHANNEL HELPERS
 # ----------------------------------------------------------------------
 def _normalize_str(s: str) -> str:
-    """
-    Приводит строку к «чистому» виду:
-        • NFKC‑нормализация;
-        • удаляем пробелы, невидимые символы (Cf, Z*, Cc);
-        • переводим к нижнему регистру.
-    """
+    """Нормализует строку (удаляет пробелы, невидимые символы, нижний регистр)."""
     s = unicodedata.normalize("NFKC", s)
     filtered = "".join(ch for ch in s
                        if not (ch.isspace() or unicodedata.category(ch) in ("Cf", "Zs", "Zl", "Zp", "Cc")))
@@ -159,17 +164,16 @@ def _normalize_str(s: str) -> str:
 def _channel_is_target_from_title(title: str) -> bool:
     if not TARGET_CHANNEL_NAME:
         return True
-    target_norm = _normalize_str(TARGET_CHANNEL_NAME)
-    title_norm = _normalize_str(title)
-    return target_norm in title_norm
+    target = _normalize_str(TARGET_CHANNEL_NAME)
+    return target in _normalize_str(title)
 
 
 def find_discord_window() -> Optional[Any]:
-    """Ищет открытое окно Discord и возвращает объект окна."""
+    """Ищет открытое окно Discord."""
     try:
         for w in gw.getWindowsWithTitle("Discord"):
             if "Discord" in w.title:
-                log_debug(f"Найдено окно Discord: {w.title}")
+                log_debug(f"Окно Discord найдено: {w.title}")
                 return w
         return None
     except Exception as e:
@@ -178,122 +182,49 @@ def find_discord_window() -> Optional[Any]:
 
 
 def _channel_is_target() -> bool:
-    """Проверяем, что активное окно Discord относится к TARGET_CHANNEL_NAME."""
+    """Проверяем, что активное окно относится к нужному каналу."""
     win = find_discord_window()
     if not win:
-        # Если окна нет – считаем, что пользователь уже в нужном канале
         log_debug("Окно Discord не найдено → считаем канал корректным")
         return True
     return _channel_is_target_from_title(win.title)
 
-# ----------------------------------------------------------------------
-# MESSAGE EXTRACTION & PARSING
-# ----------------------------------------------------------------------
-COMMAND_PATTERNS = [
-    r"/up", r"/bump", r"/like",
-    r"!\s*up", r"!\s*bump", r"!\s*like"
-]
-
-_COMMAND_REGEX = re.compile("|".join(COMMAND_PATTERNS), re.IGNORECASE)
-
-
-def extract_latest_bump_message(full_text: str) -> Optional[str]:
-    """
-    Ищет в *полном* тексте последние строки, где:
-      • встречается одна из команд (/up, /bump, /like)
-      • **после** команды присутствует хотя бы одна цифра
-
-    Возвращает блок из максимум 5 самых «свежих» подходящих строк.
-    """
-    if not full_text:
-        return None
-
-    lines = [ln.rstrip() for ln in full_text.splitlines() if ln.strip()]
-
-    # Новый критерий: цифра **после** команды
-    cmd_with_digit = re.compile(r"(?:/up|/bump|/like).*?\d", re.IGNORECASE)
-
-    candidate = [ln for ln in lines if cmd_with_digit.search(ln)]
-
-    if not candidate:
-        log_debug("В тексте не найдено строк с командами, за которыми идут цифры")
-        return None
-
-    # Возвращаем до пяти последних строк‑подходов
-    return "\n".join(candidate[-5:])
-
-
-def is_bump_message(text: str) -> bool:
-    """
-    Проверка – строка содержит одну из команд (/up, /bump, /like) и цифру,
-    расположенную **после** неё.
-    """
-    return bool(re.search(r"(?:/up|/bump|/like).*?\d", text, re.IGNORECASE))
-
-
-def _extract_time_from_line(line: str) -> Optional[int]:
-    """
-    Из строки, где уже найдена команда, вытаскивает количество секунд.
-    Поддерживает любые разделители (пробелы, двоеточия, тире, запятые и пр.).
-    """
-    match = re.search(r"(?i)(/up|/bump|/like|!\s*up|!\s*bump|!\s*like)", line)
-    if not match:
-        return None
-
-    after_cmd = line[match.end():].strip(" :‑–—,.;|#")
-    if ',' in after_cmd:
-        after_cmd = after_cmd.split(',', 1)[0]
-
-    secs = parse_duration_to_seconds(after_cmd)
-    return secs
-
-
-def parse_time_from_message(message_text: str) -> Dict[str, Any]:
-    """
-    Принимает любой текст (полный буфер, ответ /remaining и т.п.) и
-    возвращает словарь:
-
-        {
-            "/up":   int|None,
-            "/bump": int|None,
-            "/like": int|None,
-            "success": bool
-        }
-    """
-    block = extract_latest_bump_message(message_text)
-    if not block:
-        log_error("Не найден блок с командами /up /bump /like")
-        log_debug("Текст сообщения (первые 500 символов):")
-        log_debug(message_text[:500] + ("…" if len(message_text) > 500 else ""))
-        return {"/up": None, "/bump": None, "/like": None, "success": False}
-
-    result: Dict[str, Optional[int]] = {"/up": None, "/bump": None, "/like": None}
-    for cmd in ("/up", "/bump", "/like"):
-        for line in block.splitlines():
-            if re.search(rf"(?i){re.escape(cmd)}", line):
-                secs = _extract_time_from_line(line)
-                if secs is not None:
-                    result[cmd] = secs
-                    log_success(f"{cmd} → {format_seconds(secs)} (парсер)")
-                else:
-                    log_warn(f"Не удалось распарсить время из строки: «{line}»")
-                break   # переходим к следующей команде
-
-    success = any(v is not None for v in result.values())
-    result["success"] = success
-    log_debug(f"Результат парсинга: {result}")
-    return result   # type: ignore[return-value]
 
 # ----------------------------------------------------------------------
-# COPY HELPERS (контекст‑меню и Ctrl+A)
+# DOUBLE‑SPACE HELPERS
 # ----------------------------------------------------------------------
-def copy_last_message_via_context_menu() -> Optional[str]:
+def _apply_double_space(text: str) -> str:
     """
-    Копирует текст последнего сообщения в текущем канале Discord:
-    1) Прокручивает чат до самого низа;
-    2) Делает правый клик в центральной части окна (обычно под последним постом);
-    3) Нажимает клавишу `COPY_HOTKEY` – в большинстве тем «Copy Message» привязано к «c».
+    Добавляет второй пробел после знаков пунктуации .!? и в конец строки.
     """
+    # двойной пробел после . ! ?
+    text = re.sub(r'([.!?])\s+', lambda m: f"{m.group(1)}  ", text)
+    # гарантируем двойной пробел в конце
+    if not text.endswith("  "):
+        text = f"{text}  "
+    return text
+
+
+# ----------------------------------------------------------------------
+# COPY HELPERS (контекст‑меню и fallback Ctrl+A)
+# ----------------------------------------------------------------------
+def _looks_like_real_bump(text: str) -> bool:
+    """
+    Проверка, что в тексте действительно есть bump‑сообщение.
+    Требования:
+      • строка начинается с эмодзи (например, :SDC:)
+      • после эмодзи сразу /up, /bump или /like
+      • в конце строки – timestamp HH:MM:SS
+    """
+    pattern = re.compile(
+        r":\w+:\s*(/up|/bump|/like)\b.*\b\d{2}:\d{2}:\d{2}\b",
+        re.IGNORECASE
+    )
+    return any(pattern.search(line) for line in text.splitlines())
+
+
+def _copy_via_context_menu() -> Optional[str]:
+    """Копирует последнее сообщение через контекст‑меню."""
     win = find_discord_window()
     if not win:
         log_error("Окно Discord не найдено")
@@ -303,13 +234,15 @@ def copy_last_message_via_context_menu() -> Optional[str]:
         win.activate()
         time.sleep(0.3)
 
-        # Прокручиваем вниз несколько раз, чтобы гарантировать, что показан конец чата
+        # Прокручиваем в конец чата
         for _ in range(3):
             pyautogui.press('end')
             time.sleep(0.1)
 
-        left, top, width, height = map(int, (win.left, win.top, win.width, win.height))
-        click_y = top + height - COPY_CONTEXT_OFFSET_Y   # ← см. настройку выше
+        left, top, width, height = map(int,
+                                      (win.left, win.top, win.width, win.height))
+        # позиция чуть выше низа окна (настраивается коэффициентом)
+        click_y = top + height - int(height * COPY_CONTEXT_OFFSET_RATIO)
         pyautogui.moveTo(left + width // 2, click_y, duration=0.2)
         log_debug(f"Клик в контекст‑меню: ({left + width // 2}, {click_y})")
         pyautogui.rightClick()
@@ -319,22 +252,26 @@ def copy_last_message_via_context_menu() -> Optional[str]:
         time.sleep(0.2)
 
         copied = pyperclip.paste()
-        if copied:
-            log_debug("Скопировано (контекст‑меню) – первые 200 символов:")
-            log_debug(copied[:200] + ("…" if len(copied) > 200 else ""))
-        return copied if copied else None
+        if not copied:
+            log_warn("Контекст‑меню ничего не скопировало")
+            return None
+
+        log_debug("Скопировано (контекст‑меню) – первые 200 символов:")
+        log_debug(copied[:200] + ("…" if len(copied) > 200 else ""))
+
+        if _looks_like_real_bump(copied):
+            return copied
+        else:
+            log_warn("Контекст‑меню скопировало не‑bump сообщение")
+            return None
     except Exception as e:
-        log_error(f"Копирование через контекст‑меню упало: {e}")
+        log_error(f"Контекст‑меню упало: {e}")
         return None
 
 
-def _copy_using_ctrl_a() -> Optional[str]:
-    """
-    Оригинальная логика: Ctrl+A → Ctrl+C, несколько попыток.
-    Возвращает найденный блок либо None.
-    """
+def _copy_via_ctrl_a() -> Optional[str]:
+    """Копирует всё в окне Discord через Ctrl+A → Ctrl+C."""
     log_status("ПОИСК BUMP‑СООБЩЕНИЯ (Ctrl+A fallback)")
-
     win = find_discord_window()
     if win:
         try:
@@ -350,7 +287,8 @@ def _copy_using_ctrl_a() -> Optional[str]:
             log_info(f"Попытка {attempt}/{MESSAGE_SCAN_RETRIES}")
 
             if win:
-                left, top, width, height = map(int, (win.left, win.top, win.width, win.height))
+                left, top, width, height = map(int,
+                                                (win.left, win.top, win.width, win.height))
                 pyautogui.moveTo(left + width // 2, top + height // 2, duration=0.1)
             else:
                 w, h = pyautogui.size()
@@ -365,14 +303,8 @@ def _copy_using_ctrl_a() -> Optional[str]:
             time.sleep(0.25)
 
             copied = pyperclip.paste()
-            block = extract_latest_bump_message(copied)
-
-            if block and is_bump_message(block):
+            if copied and _looks_like_real_bump(copied):
                 log_success("Bump‑сообщение найдено через Ctrl+A")
-                return block
-
-            if copied and is_bump_message(copied):
-                log_success("Bump‑сообщение получено в полном тексте")
                 return copied
 
             if copied:
@@ -390,27 +322,111 @@ def _copy_using_ctrl_a() -> Optional[str]:
             pass
 
 
-def find_and_copy_bump_message() -> Optional[str]:
+def get_last_bump_message() -> Optional[str]:
     """
-    Пытается получить последнее bump‑сообщение.
-    1) Через контекстное меню (если COPY_METHOD == "context_menu").
-    2) Если не удалось – старый способ Ctrl+A.
+    Пытаемся получить bump‑сообщение:
+      1) через контекст‑меню (если выбран метод);
+      2) fallback – Ctrl+A.
+    Возвращает текст только если он прошёл проверку `_looks_like_real_bump`.
     """
-    log_status("ПОИСК BUMP‑СООБЩЕНИЯ (контекст‑меню + Ctrl+A fallback)")
-
     if COPY_METHOD == "context_menu":
-        block = copy_last_message_via_context_menu()
+        block = _copy_via_context_menu()
         if block:
-            if is_bump_message(block):
-                log_success("Bump‑сообщение найдено через контекст‑меню")
-                return block
-            else:
-                log_warn("Контекст‑меню скопировало сообщение, но оно не выглядит как bump‑сообщение")
+            log_success("Bump‑сообщение найдено через контекст‑меню")
+            return block
         else:
-            log_warn("Контекст‑меню ничего не скопировало → переходим к Ctrl+A")
+            log_warn("Контекст‑меню не дало валидного сообщения → переходим к Ctrl+A")
 
-    # Фолбэк – Ctrl+A
-    return _copy_using_ctrl_a()
+    return _copy_via_ctrl_a()
+
+
+# ----------------------------------------------------------------------
+# MESSAGE EXTRACTION & PARSING
+# ----------------------------------------------------------------------
+COMMAND_PATTERNS = [
+    r"/up", r"/bump", r"/like",
+    r"!\s*up", r"!\s*bump", r"!\s*like"
+]
+
+_COMMAND_REGEX = re.compile("|".join(COMMAND_PATTERNS), re.IGNORECASE)
+
+
+def extract_latest_bump_message(full_text: str) -> Optional[str]:
+    """
+    Ищет в полном тексте последние строки, где:
+      • есть одна из команд (/up, /bump, /like);
+      • после команды есть хотя бы одна цифра.
+    Возвращает до 5 последних подходящих строк, объединённых «\n».
+    """
+    if not full_text:
+        return None
+
+    lines = [ln.rstrip() for ln in full_text.splitlines() if ln.strip()]
+
+    # команда + цифра после неё
+    cmd_digit = re.compile(r"(?:/up|/bump|/like).*?\d", re.IGNORECASE)
+    candidate = [ln for ln in lines if cmd_digit.search(ln)]
+
+    if not candidate:
+        log_debug("Не найдено строк с командами, за которыми идут цифры")
+        return None
+
+    return "\n".join(candidate[-5:])
+
+
+def is_bump_message(text: str) -> bool:
+    """Проверка: содержит /up|/bump|/like и цифру после команды."""
+    return bool(re.search(r"(?:/up|/bump|/like).*?\d", text, re.IGNORECASE))
+
+
+def _extract_time_from_line(line: str) -> Optional[int]:
+    """
+    Из строки с найденной командой вытаскивает количество секунд.
+    """
+    match = re.search(r"(?i)(/up|/bump|/like|!\s*up|!\s*bump|!\s*like)", line)
+    if not match:
+        return None
+
+    after = line[match.end():].strip(" :‑–—,.;|#")
+    if ',' in after:
+        after = after.split(',', 1)[0]
+
+    return parse_duration_to_seconds(after)
+
+
+def parse_time_from_message(message_text: str) -> Dict[str, Any]:
+    """
+    Принимает полный текст сообщения (ответ /remaining и т.п.) и
+    возвращает словарь:
+        {
+            "/up":   int|None,
+            "/bump": int|None,
+            "/like": int|None,
+            "success": bool
+        }
+    """
+    block = extract_latest_bump_message(message_text)
+    if not block:
+        log_error("Не найден блок с командами /up /bump /like")
+        return {"/up": None, "/bump": None, "/like": None, "success": False}
+
+    result: Dict[str, Optional[int]] = {"/up": None, "/bump": None, "/like": None}
+    for cmd in ("/up", "/bump", "/like"):
+        for line in block.splitlines():
+            if re.search(rf"(?i){re.escape(cmd)}", line):
+                secs = _extract_time_from_line(line)
+                if secs is not None:
+                    result[cmd] = secs
+                    log_success(f"{cmd} → {format_seconds(secs)} (парсер)")
+                else:
+                    log_warn(f"Не удалось распарсить время из строки: «{line}»")
+                break
+
+    success = any(v is not None for v in result.values())
+    result["success"] = success
+    log_debug(f"Результат парсинга: {result}")
+    return result  # type: ignore[return-value]
+
 
 # ----------------------------------------------------------------------
 # PERSISTENCE (schedule.json, responses.json)
@@ -460,15 +476,26 @@ def save_responses() -> None:
     except Exception as e:
         log_error(f"Не удалось сохранить ответы: {e}")
 
+
 # ----------------------------------------------------------------------
 # MESSAGE SENDING (typewrite → clipboard fallback)
 # ----------------------------------------------------------------------
-def send_message(text: str, double_enter: bool = False) -> bool:
+def send_message(text: str,
+                 double_enter: bool = False,
+                 double_space: bool = False) -> bool:
     """
-    Пытается ввести `text` в активное окно Discord.
-    Сначала «typewrite», при ошибке — используем буфер обмена.
+    Пытается «ввести» `text` в активное окно Discord.
+    1) typewrite (симуляция клавиатуры);
+    2) при неудаче – через буфер обмена.
+    `double_enter` → нажать Enter дважды.
+    `double_space` → добавить двойной пробел после пунктуации и в конце.
     """
     log_info(f"Отправка сообщения: '{text[:40]}…'")
+
+    # Применяем двойной пробел, если включено глобально или передано явно
+    if DOUBLE_SPACE_ENABLED or double_space:
+        text = _apply_double_space(text)
+
     original_clip = pyperclip.paste()
 
     try:
@@ -478,9 +505,9 @@ def send_message(text: str, double_enter: bool = False) -> bool:
                 win.activate()
                 time.sleep(0.2)
             except Exception:
-                log_warn("Не удалось активировать окно Discord – будем писать в текущее")
+                log_warn("Не удалось активировать окно Discord")
         else:
-            log_warn("Окно Discord не найдено – пишем в текущее активное окно")
+            log_warn("Окно Discord не найдено – будем писать в текущем активном окне")
 
         try:
             pyautogui.typewrite(text, interval=0.02)
@@ -490,8 +517,9 @@ def send_message(text: str, double_enter: bool = False) -> bool:
             log_success("Сообщение отправлено (typewrite)")
             return True
         except Exception as e:
-            log_debug(f"Набор через typewrite не удался: {e}")
+            log_debug(f"typewrite не удался: {e}")
 
+        # fallback – буфер обмена
         pyperclip.copy(text)
         time.sleep(0.1)
         pyautogui.hotkey("ctrl", "v")
@@ -510,6 +538,7 @@ def send_message(text: str, double_enter: bool = False) -> bool:
         except Exception:
             pass
 
+
 # ----------------------------------------------------------------------
 # SCHEDULED TASK MANAGEMENT
 # ----------------------------------------------------------------------
@@ -521,15 +550,16 @@ def _schedule_parsed_commands(task: Dict[str, Any]) -> None:
     for cmd in task["commands_to_schedule"]:
         secs = task["parsed_times"].get(cmd)
         if not secs:
-            log_warn(f"В распарсенных данных нет времени для {cmd}")
+            log_warn(f"Нет времени для {cmd} в распарсенных данных")
             continue
 
-        exec_time = now + secs + 10    # 10‑сек «подушка» после кулдауна
+        exec_time = now + secs + 10           # 10‑сек «подушка» после кулдауна
         subtask = {
             "id": f"bump_{task['id']}_{cmd}",
             "time": exec_time,
             "command": cmd,
             "double_enter": task["double_enter"],
+            "double_space": DOUBLE_SPACE_ENABLED,
             "source_task_id": task["id"],
             "status": "pending",
             "created_at": datetime.now().strftime("%H:%M:%S")
@@ -552,7 +582,7 @@ def _schedule_parsed_commands(task: Dict[str, Any]) -> None:
 
 
 def execute_scheduled_tasks() -> None:
-    """Ищет задачи, время которых пришло, и отправляет команды."""
+    """Выполняет задачи, время которых пришло."""
     now = time.time()
     completed: List[Dict[str, Any]] = []
 
@@ -562,7 +592,11 @@ def execute_scheduled_tasks() -> None:
                 continue
 
             log_status(f"⚡ Выполнение: {task['command']}")
-            if send_message(task["command"], task.get("double_enter", False)):
+            if send_message(
+                task["command"],
+                task.get("double_enter", False),
+                task.get("double_space", False)
+            ):
                 task["status"] = "executed"
                 task["executed_at"] = now
                 log_success(f"Команда {task['command']} выполнена")
@@ -576,7 +610,7 @@ def execute_scheduled_tasks() -> None:
 
 
 def cleanup_old_tasks(max_age_seconds: int = 300) -> None:
-    """Убирает задачи, у которых время уже прошло более `max_age_seconds` назад."""
+    """Удаляет задачи, время которых уже прошло более `max_age_seconds` назад."""
     now = time.time()
     with state_lock:
         before = len(scheduled_tasks)
@@ -587,11 +621,12 @@ def cleanup_old_tasks(max_age_seconds: int = 300) -> None:
     if before != after:
         log_info(f"Удалено {before - after} устаревших задач")
 
+
 # ----------------------------------------------------------------------
 # BUMP‑TASK MANAGEMENT (автопарсинг)
 # ----------------------------------------------------------------------
 def add_bump_parse_task() -> None:
-    """Интерактивно создаёт задачу, которая будет парсить /remaining."""
+    """Создаёт задачу, автоматически парсит /remaining и планирует /up /bump /like."""
     log_status("Создание BUMP‑задачи")
 
     cmd = input(f"[{_now_str()}] Команда (по умолчанию /getbump): ").strip() or "/getbump"
@@ -633,9 +668,10 @@ def add_bump_parse_task() -> None:
         "start_time": time.time() + delay,
         "commands_to_schedule": commands_to_schedule,
         "double_enter": double_enter,
+        "double_space": DOUBLE_SPACE_ENABLED,
         "status": "waiting",
-        "parsed_times": {},           # будет заполнено после парсинга
-        "scheduled_subtasks": [],     # ссылки на подзадачи
+        "parsed_times": {},                # заполнится после парсинга
+        "scheduled_subtasks": [],            # ссылки на подзадачи
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
     bump_tasks.append(task)
@@ -653,7 +689,7 @@ def execute_bump_tasks() -> None:
             task["status"] = "sending"
 
         elif status == "sending":
-            if send_message(task["command"], task["double_enter"]):
+            if send_message(task["command"], task["double_enter"], task.get("double_space", False)):
                 task["status"] = "waiting_response"
                 task["response_deadline"] = now + 5
                 log_info("⏳ Ожидаем ответ от bump‑бота...")
@@ -666,7 +702,7 @@ def execute_bump_tasks() -> None:
             log_info("🔍 Переходим к чтению сообщения...")
 
         elif status == "reading":
-            msg = find_and_copy_bump_message()
+            msg = get_last_bump_message()
             if msg:
                 task["message"] = msg
                 task["status"] = "parsing"
@@ -716,6 +752,7 @@ def add_one_time_task() -> None:
             "time": time.time() + delay,
             "command": cmd,
             "double_enter": double_enter,
+            "double_space": DOUBLE_SPACE_ENABLED,
             "status": "pending",
             "created_at": datetime.now().strftime("%H:%M:%S")
         })
@@ -723,6 +760,7 @@ def add_one_time_task() -> None:
 
     exec_ts = datetime.fromtimestamp(time.time() + delay).strftime("%H:%M:%S")
     log_success(f"Команда «{cmd}» запланирована на {exec_ts}")
+
 
 # ----------------------------------------------------------------------
 # MENU & UI
@@ -740,6 +778,7 @@ def show_schedule() -> None:
             left = max(0, int(t["time"] - now))
             ts = datetime.fromtimestamp(t["time"]).strftime("%H:%M:%S")
             log_info(f"{i}. {ts} (через {format_seconds(left)}): {t['command']}")
+
 
 def show_bump_tasks() -> None:
     """Отображает список активных BUMP‑задач."""
@@ -774,8 +813,9 @@ def show_bump_tasks() -> None:
         if task.get("scheduled_subtasks"):
             log_info(f"Подзадач запланировано: {len(task['scheduled_subtasks'])}")
 
+
 def test_parser() -> None:
-    """Запускает тестовый разбор заранее подготовленного сообщения."""
+    """Тестовый разбор заранее подготовленного сообщения."""
     log_status("ТЕСТ ПАРСИНГА")
     test_msg = """Времени до
 :SDC: /up: 25 минут и 15 секунд, 17:24:25
@@ -796,6 +836,7 @@ def test_parser() -> None:
     else:
         log_error("Тест НЕ пройден")
 
+
 def show_logs() -> None:
     """Печатает последние 10 строк из лог‑файла."""
     log_status("ПОСЛЕДНИЕ 10 ЗАПИСЕЙ ЛОГА")
@@ -810,11 +851,13 @@ def show_logs() -> None:
     except Exception as e:
         log_error(f"Не удалось прочитать лог: {e}")
 
+
 def cleanup_old_schedule() -> None:
-    """Очистка устаревших (старше 5 минут) задач из расписания."""
+    """Удаляет устаревшие (старше 5 минут) задачи из расписания."""
     cleanup_old_tasks()
     save_schedule()
     log_success("Устаревшие задачи удалены")
+
 
 def show_menu() -> None:
     """Отображает главное меню и переадресует ввод."""
@@ -848,12 +891,13 @@ def show_menu() -> None:
     elif choice == "7":
         cleanup_old_schedule()
     elif choice == "8":
-        log_success("Выход…")
+        log_success("Выход...")
         save_schedule()
         save_responses()
         sys.exit(0)
     else:
         log_warn("Неверный пункт меню")
+
 
 # ----------------------------------------------------------------------
 # MAIN LOOP
@@ -889,6 +933,7 @@ def main_loop() -> None:
         save_responses()
         log_success("Работа завершена")
 
+
 # ----------------------------------------------------------------------
 # ENTRY POINT
 # ----------------------------------------------------------------------
@@ -897,15 +942,12 @@ def main() -> None:
     print("🤖 DISCORD BUMP BOT (автоматический режим) – полная переработка")
     print("=" * 60)
 
-    # ускоряем набор текста – пауза 0.05 сек между символами
-    pyautogui.PAUSE = 0.05
-    pyautogui.FAILSAFE = False   # отключаем «выход» движением мыши в угол
+    pyautogui.PAUSE = 0.05          # ускоряем набор текста
+    pyautogui.FAILSAFE = False      # отключаем «выход» движением мыши в угол
 
-    # загрузка данных
     load_schedule()
     load_responses()
 
-    # стартовое сообщение
     log_status("ИНСТРУКЦИЯ")
     log_info("1. Откройте Discord и перейдите в канал с bump‑ботом.")
     log_info(f"2. Нажмите {HOTKEY.upper()} для вызова меню.")
