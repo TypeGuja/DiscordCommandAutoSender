@@ -32,6 +32,8 @@ import pyautogui
 import pyperclip
 import pygetwindow as gw
 
+import platform  # ← новое
+
 # ----------------------------------------------------------------------
 # CONFIGURATION
 # ----------------------------------------------------------------------
@@ -57,7 +59,7 @@ state_lock = Lock()
 task_counter = 0
 
 scheduled_tasks: List[Dict[str, Any]] = []   # отложенные однократные команды
-bump_tasks: List[Dict[str, Any]] = []        # задачи автопарсинга (только в текущей сессии)
+bump_tasks: List[Dict[str, Any]] = []      # задачи автопарсинга (только в текущей сессии)
 
 # ----------------------------------------------------------------------
 # LOGGING HELPERS
@@ -206,6 +208,40 @@ def _apply_double_space(text: str) -> str:
 
 
 # ----------------------------------------------------------------------
+# HELPER FUNCTIONS: раскладка и валидация команд
+# ----------------------------------------------------------------------
+def switch_to_english_layout() -> None:
+    """
+    Переключает раскладку клавиатуры на английскую (Windows).
+    Если у вас используется другое сочетание переключения,
+    замените строку `keyboard.send('alt+shift')` на нужное.
+    """
+    if platform.system() != "Windows":
+        return
+    # По умолчанию в Windows переключение – Alt+Shift.
+    keyboard.send('alt+shift')
+    time.sleep(0.2)
+
+
+def _validate_command(cmd: str) -> bool:
+    """
+    Проверка команды перед записью в расписание.
+    Возвращает True, если команда выглядит корректно:
+      • не пустая;
+      • не содержит символа '|';
+      • если начинается с '/' или '!' – считается slash‑командой.
+    """
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    if "|" in cmd:
+        return False
+    if cmd.startswith("/") or cmd.startswith("!"):
+        return True
+    # Допускаем любые обычные тексты (например, произвольные сообщения)
+    return True
+
+
+# ----------------------------------------------------------------------
 # COPY HELPERS (контекст‑меню и fallback Ctrl+A)
 # ----------------------------------------------------------------------
 def _looks_like_real_bump(text: str) -> bool:
@@ -239,8 +275,7 @@ def _copy_via_context_menu() -> Optional[str]:
             pyautogui.press('end')
             time.sleep(0.1)
 
-        left, top, width, height = map(int,
-                                      (win.left, win.top, win.width, win.height))
+        left, top, width, height = map(int, (win.left, win.top, win.width, win.height))
         # позиция чуть выше низа окна (настраивается коэффициентом)
         click_y = top + height - int(height * COPY_CONTEXT_OFFSET_RATIO)
         pyautogui.moveTo(left + width // 2, click_y, duration=0.2)
@@ -287,8 +322,7 @@ def _copy_via_ctrl_a() -> Optional[str]:
             log_info(f"Попытка {attempt}/{MESSAGE_SCAN_RETRIES}")
 
             if win:
-                left, top, width, height = map(int,
-                                                (win.left, win.top, win.width, win.height))
+                left, top, width, height = map(int, (win.left, win.top, win.width, win.height))
                 pyautogui.moveTo(left + width // 2, top + height // 2, duration=0.1)
             else:
                 w, h = pyautogui.size()
@@ -435,7 +469,25 @@ def load_schedule() -> None:
     global scheduled_tasks
     try:
         with open(SCHEDULE_FILE, "r", encoding="utf-8") as f:
-            scheduled_tasks = json.load(f)
+            raw = json.load(f)
+
+        # Фильтрация записей с некорректными командами
+        filtered: List[Dict[str, Any]] = []
+        for t in raw:
+            if isinstance(t, dict):
+                cmd = t.get("command", "")
+                if _validate_command(cmd):
+                    filtered.append(t)
+                else:
+                    log_warn(f"Удалена некорректная задача из расписания: {t}")
+            else:
+                log_warn(f"Неправильный формат записи в расписании (не dict): {t}")
+
+        scheduled_tasks = filtered
+        if len(raw) != len(filtered):
+            log_warn("В расписании обнаружены и удалены некорректные задачи")
+            save_schedule()
+
         log_success(f"Загружено {len(scheduled_tasks)} задач из {SCHEDULE_FILE}")
     except FileNotFoundError:
         scheduled_tasks = []
@@ -478,15 +530,45 @@ def save_responses() -> None:
 
 
 # ----------------------------------------------------------------------
-# MESSAGE SENDING (typewrite → clipboard fallback)
+# MESSAGE SENDING HELPERS (typewrite → clipboard fallback)
 # ----------------------------------------------------------------------
+def _send_via_typewrite(text: str) -> bool:
+    """Пытается набрать строку через pyautogui.typewrite."""
+    try:
+        pyautogui.typewrite(text, interval=0.02)
+        pyautogui.press("enter")
+        return True
+    except Exception as e:
+        log_debug(f"typewrite failed: {e}")
+        return False
+
+
+def _send_via_clipboard(text: str, double_enter: bool = False) -> bool:
+    """Отправка сообщения через буфер обмена – гарантированный способ."""
+    original = pyperclip.paste()
+    try:
+        pyperclip.copy(text)
+        time.sleep(0.1)
+        pyautogui.hotkey("ctrl", "v")
+        pyautogui.press("enter")
+        if double_enter:
+            pyautogui.press("enter")
+        return True
+    finally:
+        try:
+            pyperclip.copy(original)
+        except Exception:
+            pass
+
+
 def send_message(text: str,
                  double_enter: bool = False,
                  double_space: bool = False) -> bool:
     """
     Пытается «ввести» `text` в активное окно Discord.
-    1) typewrite (симуляция клавиатуры);
-    2) при неудаче – через буфер обмена.
+    1) Если сообщение начинается с «/» – используем clipboard‑fallback,
+       чтобы гарантировать правильный слеш независимо от раскладки.
+    2) Иначе – сначала пробуем typewrite, а при неудаче – тоже clipboard.
     `double_enter` → нажать Enter дважды.
     `double_space` → добавить двойной пробел после пунктуации и в конце.
     """
@@ -496,47 +578,18 @@ def send_message(text: str,
     if DOUBLE_SPACE_ENABLED or double_space:
         text = _apply_double_space(text)
 
-    original_clip = pyperclip.paste()
+    # Если команда – отправляем через буфер обмена (гарантия корректного слеша)
+    if text.startswith("/"):
+        log_debug("Сообщение начинается с '/', используем clipboard‑fallback")
+        return _send_via_clipboard(text, double_enter)
 
-    try:
-        win = find_discord_window()
-        if win:
-            try:
-                win.activate()
-                time.sleep(0.2)
-            except Exception:
-                log_warn("Не удалось активировать окно Discord")
-        else:
-            log_warn("Окно Discord не найдено – будем писать в текущем активном окне")
-
-        try:
-            pyautogui.typewrite(text, interval=0.02)
-            pyautogui.press("enter")
-            if double_enter:
-                pyautogui.press("enter")
-            log_success("Сообщение отправлено (typewrite)")
-            return True
-        except Exception as e:
-            log_debug(f"typewrite не удался: {e}")
-
-        # fallback – буфер обмена
-        pyperclip.copy(text)
-        time.sleep(0.1)
-        pyautogui.hotkey("ctrl", "v")
-        time.sleep(0.1)
-        pyautogui.press("enter")
-        if double_enter:
-            pyautogui.press("enter")
-        log_success("Сообщение отправлено (clipboard)")
+    # Пытаемся набрать обычным способом; если не получается – переходим к clipboard
+    if _send_via_typewrite(text):
+        log_success("Сообщение отправлено (typewrite)")
         return True
-    except Exception as e:
-        log_error(f"Не удалось отправить сообщение: {e}")
-        return False
-    finally:
-        try:
-            pyperclip.copy(original_clip)
-        except Exception:
-            pass
+
+    log_debug("typewrite не удался → используем clipboard")
+    return _send_via_clipboard(text, double_enter)
 
 
 # ----------------------------------------------------------------------
@@ -630,6 +683,9 @@ def add_bump_parse_task() -> None:
     log_status("Создание BUMP‑задачи")
 
     cmd = input(f"[{_now_str()}] Команда (по умолчанию /getbump): ").strip() or "/getbump"
+    if not _validate_command(cmd):
+        log_error("Команда некорректна (проверьте отсутствие символа '|').")
+        return
     log_info(f"Команда: {cmd}")
 
     try:
@@ -671,7 +727,7 @@ def add_bump_parse_task() -> None:
         "double_space": DOUBLE_SPACE_ENABLED,
         "status": "waiting",
         "parsed_times": {},                # заполнится после парсинга
-        "scheduled_subtasks": [],            # ссылки на подзадачи
+        "scheduled_subtasks": [],        # ссылки на подзадачи
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
     bump_tasks.append(task)
@@ -736,8 +792,8 @@ def execute_bump_tasks() -> None:
 def add_one_time_task() -> None:
     """Позволяет добавить произвольную команду, которая выполнится через N секунд."""
     cmd = input(f"[{_now_str()}] Введите команду: ").strip()
-    if not cmd:
-        log_error("Команда не может быть пустой")
+    if not _validate_command(cmd):
+        log_error("Команда неприемлема (проверьте отсутствие символа '|', пустую строку и т.п.)")
         return
     try:
         delay = int(input(f"[{_now_str()}] Через сколько секунд выполнить? ").strip())
@@ -853,7 +909,7 @@ def show_logs() -> None:
 
 
 def cleanup_old_schedule() -> None:
-    """Удаляет устаревшие (старше 5 минут) задачи из расписания."""
+    """Удаляет устаревшее (старше 5 минут) задачи из расписания."""
     cleanup_old_tasks()
     save_schedule()
     log_success("Устаревшие задачи удалены")
